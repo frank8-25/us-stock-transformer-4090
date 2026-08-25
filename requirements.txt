@@ -1,0 +1,9 @@
+pandas
+requests
+transformers
+yfinance
+pytrends
+torch
+scikit-learn
+pypdf
+beautifulsoup4
