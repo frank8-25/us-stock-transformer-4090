@@ -10,3 +10,5 @@ bitsandbytes==0.50.2
 pandas==3.0.5
 huggingface-hub==1.30.0
 tokenizers==0.23.2
+protobuf==7.36.1
+tiktoken==0.14.0
