@@ -130,3 +130,7 @@ def ensure_directories() -> None:
         MODEL_DIR,
     ]:
         Path(path).mkdir(parents=True, exist_ok=True)
+
+# FinGPT defaults for RTX 4090.
+FINGPT_DEFAULT_MODEL_PROFILE = "sentiment-llama2-13b"
+FINGPT_DEFAULT_QUANTIZATION = "4bit"

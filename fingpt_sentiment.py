@@ -5,6 +5,8 @@ from typing import Iterable
 
 import pandas as pd
 
+from config import FINGPT_DEFAULT_MODEL_PROFILE, FINGPT_DEFAULT_QUANTIZATION
+
 
 FINGPT_SENTIMENT_MODEL = "FinGPT/fingpt-sentiment_llama2-13b_lora"
 FINGPT_BASE_MODEL = "NousResearch/Llama-2-13b-hf"
@@ -34,7 +36,7 @@ FINGPT_MODEL_PROFILES = {
 FINGPT_MODEL_PROFILES["sentiment-llama2-13b"]["architecture"] = "causal_lm"
 FINGPT_PROMPT = (
     "Instruction: What is the sentiment of this news? "
-    "Please choose an answer from {negative/neutral/positive}\n"
+    "Please choose an answer from {{negative/neutral/positive}}\n"
     "Input: {text}\n"
     "Answer: "
 )
@@ -42,6 +44,8 @@ FINGPT_SENTIMENT_COLUMNS = [
     "sentiment_label",
     "sentiment_score",
     "model_name",
+    "model_profile",
+    "fingpt_error",
     "fingpt_raw_output",
     "fingpt_inference_seconds",
 ]
@@ -110,8 +114,8 @@ def get_torch_hardware() -> dict:
 
 def load_fingpt_model(
     allow_cpu: bool = False,
-    model_profile: str = "sentiment-llama2-13b",
-    quantization: str = "4bit",
+    model_profile: str = FINGPT_DEFAULT_MODEL_PROFILE,
+    quantization: str = FINGPT_DEFAULT_QUANTIZATION,
 ):
     import torch
 
@@ -132,60 +136,40 @@ def load_fingpt_model(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(0)
 
-    tokenizer = AutoTokenizer.from_pretrained(profile["base_model"], trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    if profile["architecture"] == "chatglm":
-        config = AutoConfig.from_pretrained(profile["base_model"], trust_remote_code=True)
-        if not hasattr(config, "max_length"):
-            config.max_length = getattr(config, "seq_length", 2048)
-        base_model = AutoModel.from_pretrained(
-            profile["base_model"],
-            config=config,
-            trust_remote_code=True,
+    if quantization not in {"4bit", "8bit", "fp16"}:
+        raise ValueError(f"Unsupported quantization: {quantization}")
+    if not hardware["cuda_available"] and quantization != "fp16":
+        raise ValueError("CPU experiments require --quantization fp16 (loaded as float32).")
+    remote_code = profile["architecture"] == "chatglm"
+    tokenizer = AutoTokenizer.from_pretrained(profile["base_model"], trust_remote_code=remote_code)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    compute_dtype = (
+        torch.bfloat16 if hardware["cuda_available"] and torch.cuda.is_bf16_supported()
+        else torch.float16 if hardware["cuda_available"] else torch.float32
+    )
+    model_kwargs = {
+        "trust_remote_code": remote_code,
+        "device_map": "auto",
+        "dtype": compute_dtype if quantization != "fp16" else (
+            torch.float16 if hardware["cuda_available"] else torch.float32
+        ),
+    }
+    if quantization == "4bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype, bnb_4bit_use_double_quant=True,
         )
-        if hardware["cuda_available"] and quantization == "4bit" and hasattr(base_model, "quantize"):
-            base_model = base_model.quantize(4).cuda()
-        elif hardware["cuda_available"]:
-            base_model = base_model.half().cuda()
-    elif hardware["cuda_available"]:
-        if quantization == "4bit":
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-            base_model = AutoModelForCausalLM.from_pretrained(
-                profile["base_model"],
-                trust_remote_code=True,
-                device_map={"": 0},
-                quantization_config=quantization_config,
-            )
-        elif quantization == "8bit":
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-            base_model = AutoModelForCausalLM.from_pretrained(
-                profile["base_model"],
-                trust_remote_code=True,
-                device_map={"": 0},
-                quantization_config=quantization_config,
-            )
-        else:
-            base_model = AutoModelForCausalLM.from_pretrained(
-                profile["base_model"],
-                trust_remote_code=True,
-                device_map={"": 0},
-                torch_dtype=torch.float16,
-            )
-    else:
-        base_model = AutoModelForCausalLM.from_pretrained(
-            profile["base_model"],
-            trust_remote_code=True,
-            device_map="cpu",
-            torch_dtype=torch.float32,
-        )
-
-    model = PeftModel.from_pretrained(base_model, profile["model_name"])
+    elif quantization == "8bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    model_class = AutoModelForCausalLM
+    if remote_code:
+        # ChatGLM2 depends on legacy remote code; compatibility errors propagate.
+        model_class = AutoModel
+        model_kwargs["config"] = AutoConfig.from_pretrained(profile["base_model"], trust_remote_code=True)
+    base_model = model_class.from_pretrained(profile["base_model"], **model_kwargs)
+    model = PeftModel.from_pretrained(base_model, profile["model_name"], is_trainable=False)
     model = model.eval()
     peak_allocated = None
     peak_reserved = None
@@ -226,6 +210,8 @@ def run_fingpt_batch(
         seconds = time.perf_counter() - start
         results = []
         for output in decoded:
+            if not output.strip():
+                raise RuntimeError("FinGPT generated an empty response.")
             label = parse_sentiment_label(output)
             results.append(
                 {
@@ -233,6 +219,7 @@ def run_fingpt_batch(
                     "sentiment_score": score_label(label or "neutral"),
                     "model_name": model_name,
                     "fingpt_raw_output": output.strip(),
+                    "fingpt_error": "",
                 }
             )
         return results, seconds
@@ -254,10 +241,14 @@ def run_fingpt_batch(
             pad_token_id=tokenizer.eos_token_id,
         )
     seconds = time.perf_counter() - start
-    decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+    decoded = tokenizer.batch_decode(
+        generated[:, tokens["input_ids"].shape[1]:], skip_special_tokens=True,
+    )
     results = []
     for output in decoded:
-        raw_answer = output.split("Answer:")[-1].strip()
+        raw_answer = output.strip()
+        if not raw_answer:
+            raise RuntimeError("FinGPT generated an empty response.")
         label = parse_sentiment_label(raw_answer)
         results.append(
             {
@@ -265,6 +256,7 @@ def run_fingpt_batch(
                 "sentiment_score": score_label(label or "neutral"),
                 "model_name": model_name,
                 "fingpt_raw_output": raw_answer,
+                "fingpt_error": "",
             }
         )
     return results, seconds
@@ -275,9 +267,11 @@ def analyze_texts_with_fingpt(
     text_column: str,
     batch_size: int = 1,
     allow_cpu: bool = False,
-    model_profile: str = "sentiment-llama2-13b",
-    quantization: str = "4bit",
+    model_profile: str = FINGPT_DEFAULT_MODEL_PROFILE,
+    quantization: str = FINGPT_DEFAULT_QUANTIZATION,
 ) -> pd.DataFrame:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
     df = df.copy()
     if df.empty:
         for column in FINGPT_SENTIMENT_COLUMNS:
@@ -293,10 +287,13 @@ def analyze_texts_with_fingpt(
     texts = df[text_column].fillna("").astype(str).tolist()
     for start_idx in range(0, len(texts), batch_size):
         batch = texts[start_idx : start_idx + batch_size]
-        batch_results, seconds = run_fingpt_batch(tokenizer, model, batch)
+        batch_results, seconds = run_fingpt_batch(
+            tokenizer, model, batch, model_name=FINGPT_MODEL_PROFILES[model_profile]["model_name"],
+        )
         per_item_seconds = seconds / max(len(batch), 1)
         for result in batch_results:
             result["fingpt_inference_seconds"] = per_item_seconds
+            result["model_profile"] = model_profile
         all_results.extend(batch_results)
 
     for column in FINGPT_SENTIMENT_COLUMNS:

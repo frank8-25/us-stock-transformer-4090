@@ -10,6 +10,8 @@ from pathlib import Path
 import pandas as pd
 
 from config import (
+    FINGPT_DEFAULT_MODEL_PROFILE,
+    FINGPT_DEFAULT_QUANTIZATION,
     RAW_EARNINGS_CALL_FILE,
     RAW_NEWS_FILE,
     RAW_TEN_K_FILE,
@@ -50,10 +52,10 @@ def read_sample(path: str, limit: int, source: str) -> pd.DataFrame:
 
     df = df.copy()
     if source == "news":
-        df["text"] = df.get("title", "").fillna("").astype(str).str.strip()
+        df["text"] = df.get("title", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
         dedupe_columns = [column for column in ["date", "title", "url"] if column in df.columns]
     else:
-        df["text"] = (df.get("title", "").fillna("").astype(str) + "\n" + df.get("content", "").fillna("").astype(str)).str.strip()
+        df["text"] = (df.get("title", pd.Series("", index=df.index)).fillna("").astype(str) + "\n" + df.get("content", pd.Series("", index=df.index)).fillna("").astype(str)).str.strip()
         dedupe_columns = [column for column in ["date", "title", "url"] if column in df.columns]
     if dedupe_columns:
         df = df.drop_duplicates(subset=dedupe_columns)
@@ -137,6 +139,7 @@ def write_report(report: dict, sample_outputs: pd.DataFrame) -> None:
         "- `model_name`",
         "- `fingpt_raw_output`",
         "- `fingpt_inference_seconds`",
+        "- `fingpt_error`",
         "",
         "No `positive_probability`, `negative_probability`, or `neutral_probability` columns were emitted, because the official model-card inference example decodes generated text labels rather than calibrated class probabilities.",
         "",
@@ -149,14 +152,18 @@ def write_report(report: dict, sample_outputs: pd.DataFrame) -> None:
         "## Result",
         "",
         f"- Status: `{report.get('status')}`",
-        f"- Error: `{report.get('error')}`",
+        f"- fingpt_error: `{report.get('fingpt_error')}`",
+        "",
+        "```text",
+        report.get("traceback", ""),
+        "```",
         f"- Suitable for full 2020-2026 dataset now: `{report.get('suitable_for_full_dataset')}`",
         f"- Recommendation: {report.get('recommendation')}",
     ]
     Path(REPORT_FILE).write_text("\n".join(lines), encoding="utf-8")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--news-limit", type=int, default=100)
     parser.add_argument("--call-limit", type=int, default=5)
@@ -166,9 +173,9 @@ def main() -> None:
     parser.add_argument(
         "--model-profile",
         choices=sorted(FINGPT_MODEL_PROFILES),
-        default="sentiment-llama2-13b",
+        default=FINGPT_DEFAULT_MODEL_PROFILE,
     )
-    parser.add_argument("--quantization", choices=["4bit", "8bit", "fp16"], default="4bit")
+    parser.add_argument("--quantization", choices=["4bit", "8bit", "fp16"], default=FINGPT_DEFAULT_QUANTIZATION)
     parser.add_argument(
         "--text",
         type=str,
@@ -176,6 +183,8 @@ def main() -> None:
         help="Run one direct-text smoke test without reading News, Earnings Call, or 10-K CSV files.",
     )
     args = parser.parse_args()
+    if args.batch_size < 1 or min(args.news_limit, args.call_limit, args.tenk_limit) < 0:
+        parser.error("batch-size must be positive and sample limits must be nonnegative.")
     direct_text = args.text.strip() if args.text is not None else None
     if args.text is not None and not direct_text:
         parser.error("--text cannot be empty.")
@@ -214,6 +223,7 @@ def main() -> None:
         "avg_inference_seconds": None,
         "status": "not_started",
         "error": None,
+        "fingpt_error": "",
         "suitable_for_full_dataset": False,
         "recommendation": "Smoke test did not complete.",
     }
@@ -235,14 +245,16 @@ def main() -> None:
     )
 
     output_df = sample_df.copy()
-    if sample_df.empty:
-        report["status"] = "failed"
-        report["error"] = "No sample rows were available from current NVDA raw files."
-        write_report(report, output_df)
-        save_csv(output_df, str(SAMPLE_OUTPUT))
-        return
+    rows = []
+    for column in ["sentiment_label", "sentiment_score", "fingpt_raw_output",
+                   "fingpt_inference_seconds", "fingpt_error"]:
+        output_df[column] = None
+    output_df["model_profile"] = args.model_profile
+    output_df["model_name"] = report["model_name"]
 
     try:
+        if sample_df.empty:
+            raise ValueError("No sample rows were available from the configured raw CSV files.")
         load_start = time.perf_counter()
         tokenizer, model, load_info = load_fingpt_model(
             allow_cpu=args.allow_cpu,
@@ -268,9 +280,13 @@ def main() -> None:
                 batch,
                 model_name=load_info.model_name,
             )
+            if len(batch_results) != len(batch):
+                raise RuntimeError("FinGPT returned a different number of results than inputs.")
             total_inference_seconds += seconds
             for source_row, result in zip(sample_df.iloc[start_idx : start_idx + effective_batch_size].to_dict("records"), batch_results):
                 raw_output = result.get("fingpt_raw_output", "")
+                if result.get("fingpt_error") or not raw_output.strip():
+                    raise RuntimeError(result.get("fingpt_error") or "FinGPT generated an empty response.")
                 rows.append(
                     {
                         **source_row,
@@ -279,6 +295,7 @@ def main() -> None:
                         "model_profile": args.model_profile,
                         "model_name": result.get("model_name"),
                         "fingpt_raw_output": raw_output,
+                        "fingpt_error": "",
                         "parsed_from_raw_output": parse_sentiment_label(raw_output),
                         "fingpt_inference_seconds": round(seconds / max(len(batch), 1), 4),
                     }
@@ -297,13 +314,14 @@ def main() -> None:
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
-        report["traceback"] = traceback.format_exc(limit=6)
-        output_df["sentiment_label"] = ""
-        output_df["sentiment_score"] = ""
-        output_df["model_profile"] = args.model_profile
-        output_df["model_name"] = FINGPT_MODEL_PROFILES[args.model_profile]["model_name"]
-        output_df["fingpt_raw_output"] = ""
-        output_df["fingpt_inference_seconds"] = ""
+        report["fingpt_error"] = report["error"]
+        report["traceback"] = traceback.format_exc()
+        traceback.print_exc()
+        report["completed_rows"] = len(rows)
+        # Preserve completed rows; mark failed and unattempted rows explicitly.
+        pending = output_df.iloc[len(rows):].copy()
+        pending["fingpt_error"] = report["fingpt_error"]
+        output_df = pd.concat([pd.DataFrame(rows), pending], ignore_index=True)
         if not hardware["cuda_available"]:
             report["recommendation"] = (
                 "Current Torch environment has no CUDA GPU. FinGPT v3.3 is a 13B LoRA model, "
@@ -324,16 +342,18 @@ def main() -> None:
             "model_profile",
             "model_name",
             "fingpt_inference_seconds",
+            "fingpt_error",
         ]
         direct_output = {
-            field: output_df.iloc[0].get(field)
+            field: output_df.head(1).to_dict(orient="records")[0].get(field)
             for field in direct_fields
             if field in output_df.columns
         }
         print(json.dumps(direct_output, ensure_ascii=False, indent=2))
     print(f"Report: {REPORT_FILE}")
     print(f"Archive: {ARCHIVE_DIR}")
+    return 0 if report["status"] == "completed" else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,5 +1,12 @@
-transformers==4.32.0
-peft==0.5.0
-accelerate
-sentencepiece
-bitsandbytes
+# Imported successfully in fingpt4090 (Python 3.11 / RTX 4090).
+# Keep existing torch 2.14.0+cu130; do not reinstall torch.
+# Apply without changing torch: python -m pip install --no-deps -r requirements-fingpt.txt
+# Actual model inference requires a separate smoke test.
+transformers==5.16.1
+peft==0.20.0
+accelerate==1.14.0
+sentencepiece==0.2.2
+bitsandbytes==0.50.2
+pandas==3.0.5
+huggingface-hub==1.30.0
+tokenizers==0.23.2
