@@ -154,7 +154,7 @@ pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
 </head>
 <body><main>
 <h1>FinGPT smoke test</h1>
-<p class="subtitle">Sentiment results ? self-contained offline report</p>
+<p class="subtitle">Sentiment results &middot; self-contained offline report</p>
 <section><dl>{details}</dl></section>
 <div class="cards">{cards}</div>
 {error_block}
