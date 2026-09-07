@@ -2,9 +2,11 @@ import argparse
 import importlib.util
 import json
 import platform
+import shutil
+from uuid import uuid4
 import time
 import traceback
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -29,12 +31,24 @@ from fingpt_sentiment import (
     run_fingpt_batch,
 )
 from pipeline_utils import save_csv
+from fingpt_report import HTML_REPORT_FILE, summarize_results, write_html_report
 
 
 REPORT_FILE = "fingpt_smoke_test_report.md"
-ARCHIVE_DIR = Path(f"data/archive/{date.today().isoformat()}_fingpt_experiment")
-SAMPLE_OUTPUT = ARCHIVE_DIR / "processed_sample" / f"{TICKER}_fingpt_smoke_sample_outputs.csv"
-MODEL_CONFIG_OUTPUT = ARCHIVE_DIR / "fingpt_model_config.json"
+ARCHIVE_ROOT = Path("data/archive")
+
+
+def create_run_directory(started_at: datetime) -> Path:
+    # Exclusive creation protects existing runs even in the unlikely event of a collision.
+    ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
+    while True:
+        run_id = started_at.strftime("%Y-%m-%d_%H%M%S_%f") + "_" + uuid4().hex[:8]
+        directory = ARCHIVE_ROOT / f"{run_id}_fingpt_experiment"
+        try:
+            directory.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        return directory
 
 
 def dependency_status() -> dict:
@@ -87,12 +101,17 @@ def build_direct_text_sample(text: str) -> pd.DataFrame:
     )
 
 
-def write_report(report: dict, sample_outputs: pd.DataFrame) -> None:
+def write_report(report: dict, sample_outputs: pd.DataFrame,
+                 path: str | Path = REPORT_FILE) -> None:
     examples = sample_outputs.head(8).to_dict(orient="records") if not sample_outputs.empty else []
     lines = [
         "# FinGPT Smoke Test Report",
         "",
         f"- Date: {date.today().isoformat()}",
+        f"- Run ID: {report.get('run_id')}",
+        f"- Started at: {report.get('started_at')}",
+        f"- Finished at: {report.get('finished_at')}",
+        f"- Model profile: {report.get('model_profile')}",
         f"- Ticker: {TICKER}",
         f"- FinGPT model: `{report.get('model_name') or FINGPT_SENTIMENT_MODEL}`",
         f"- Base model: `{report.get('base_model') or FINGPT_BASE_MODEL}`",
@@ -121,6 +140,9 @@ def write_report(report: dict, sample_outputs: pd.DataFrame) -> None:
         f"- 10-K chunks requested: `{report.get('tenk_limit')}`",
         f"- Rows available for smoke test: `{report.get('sample_rows')}`",
         f"- Rows completed: `{report.get('completed_rows')}`",
+        f"- Successful rows: `{report.get('successful_rows')}`",
+        f"- Failed / incomplete rows: `{report.get('failed_rows')}`",
+        "Only sentiment is validated. Multidimensional outputs will be designed and validated in a later phase.",
         "",
         "## Timing",
         "",
@@ -160,7 +182,7 @@ def write_report(report: dict, sample_outputs: pd.DataFrame) -> None:
         f"- Suitable for full 2020-2026 dataset now: `{report.get('suitable_for_full_dataset')}`",
         f"- Recommendation: {report.get('recommendation')}",
     ]
-    Path(REPORT_FILE).write_text("\n".join(lines), encoding="utf-8")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> int:
@@ -190,8 +212,10 @@ def main() -> int:
         parser.error("--text cannot be empty.")
 
     ensure_directories()
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_CONFIG_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now().astimezone()
+    archive_dir = create_run_directory(started_at)
+    sample_output = archive_dir / "processed_sample" / f"{TICKER}_fingpt_smoke_sample_outputs.csv"
+    model_config_output = archive_dir / "fingpt_model_config.json"
 
     hardware = get_torch_hardware()
     deps = dependency_status()
@@ -204,6 +228,8 @@ def main() -> int:
     )
     report = {
         **hardware,
+        "run_id": archive_dir.name.removesuffix("_fingpt_experiment"),
+        "started_at": started_at.isoformat(timespec="seconds"),
         "dependencies": deps,
         "news_limit": args.news_limit,
         "call_limit": args.call_limit,
@@ -227,9 +253,11 @@ def main() -> int:
         "suitable_for_full_dataset": False,
         "recommendation": "Smoke test did not complete.",
     }
-    MODEL_CONFIG_OUTPUT.write_text(
+    model_config_output.write_text(
         json.dumps(
             {
+                "run_id": report["run_id"],
+                "started_at": report["started_at"],
                 "model_profile": args.model_profile,
                 "model_name": FINGPT_MODEL_PROFILES[args.model_profile]["model_name"],
                 "base_model": FINGPT_MODEL_PROFILES[args.model_profile]["base_model"],
@@ -332,8 +360,19 @@ def main() -> int:
         else:
             report["recommendation"] = "Resolve the reported model load/inference error before scaling beyond smoke test."
 
-    save_csv(output_df, str(SAMPLE_OUTPUT))
-    write_report(report, output_df)
+    report["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    summary = summarize_results(output_df)
+    report["successful_rows"] = summary["success"]
+    report["failed_rows"] = summary["failed"]
+    report["avg_inference_seconds"] = summary["average_seconds"]
+    save_csv(output_df, str(sample_output))
+    archived_markdown = archive_dir / REPORT_FILE
+    archived_html = archive_dir / HTML_REPORT_FILE
+    write_report(report, output_df, archived_markdown)
+    write_html_report(report, output_df, archived_html)
+    # Archive first; only these documented latest-report aliases are replaced.
+    shutil.copyfile(archived_markdown, REPORT_FILE)
+    shutil.copyfile(archived_html, HTML_REPORT_FILE)
     if direct_text is not None and not output_df.empty:
         direct_fields = [
             "sentiment_label",
@@ -351,7 +390,8 @@ def main() -> int:
         }
         print(json.dumps(direct_output, ensure_ascii=False, indent=2))
     print(f"Report: {REPORT_FILE}")
-    print(f"Archive: {ARCHIVE_DIR}")
+    print(f"HTML report (latest): {HTML_REPORT_FILE}")
+    print(f"Archive: {archive_dir}")
     return 0 if report["status"] == "completed" else 1
 
 

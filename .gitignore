@@ -62,6 +62,7 @@ data/archive/**
 !data/archive/**/
 !data/archive/**/README.md
 fingpt_smoke_test_report.md
+fingpt_smoke_test_report.html
 outputs/
 output/
 runs/
