@@ -1,0 +1,4 @@
+# Optional network/PDF stages only. Core offline pipeline uses existing numpy/pandas/torch.
+# Do not reinstall Torch or the FinGPT stack when adding these optional dependencies.
+pypdf
+yfinance
