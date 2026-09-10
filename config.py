@@ -134,3 +134,40 @@ def ensure_directories() -> None:
 # FinGPT defaults for RTX 4090.
 FINGPT_DEFAULT_MODEL_PROFILE = "sentiment-llama2-13b"
 FINGPT_DEFAULT_QUANTIZATION = "4bit"
+
+# Model pairs shared by smoke tests and the pipeline.
+# MT adapter metadata: base_models/Llama-2-7b-hf (a training-local path).
+# Official remote mapping: meta-llama/Llama-2-7b-hf. Verified 2026-09-09
+# using metadata/code only; no 7B weights were downloaded or loaded.
+# https://huggingface.co/FinGPT/fingpt-mt_llama2-7b_lora/raw/main/adapter_config.json
+# https://github.com/AI4Finance-Foundation/FinGPT/blob/master/fingpt/FinGPT_Benchmark/utils.py
+FINGPT_SENTIMENT_MODEL = "FinGPT/fingpt-sentiment_llama2-13b_lora"
+FINGPT_BASE_MODEL = "NousResearch/Llama-2-13b-hf"
+FINGPT_ADAPTER_TYPE = "LoRA"
+FINGPT_MODEL_PROFILES = {
+    "sentiment-llama2-13b": {
+        "model_name": "FinGPT/fingpt-sentiment_llama2-13b_lora",
+        "base_model": "NousResearch/Llama-2-13b-hf",
+        "base_model_description": "Llama2-13B",
+        "task": "Sentiment Analysis",
+    },
+    "mt-llama2-7b": {
+        "model_name": "FinGPT/fingpt-mt_llama2-7b_lora",
+        "base_model": "meta-llama/Llama-2-7b-hf",
+        "base_model_description": "Llama2-7B",
+        "task": "Multi-Task, using Financial Sentiment Analysis instruction",
+        "architecture": "causal_lm",
+    },
+    "sentiment-chatglm2-6b": {
+        "model_name": "oliverwang15/FinGPT_ChatGLM2_Sentiment_Instruction_LoRA_FT",
+        "base_model": "THUDM/chatglm2-6b",
+        "base_model_description": "ChatGLM2-6B",
+        "task": "Sentiment Analysis",
+        "architecture": "chatglm",
+    },
+}
+FINGPT_MODEL_PROFILES["sentiment-llama2-13b"]["architecture"] = "causal_lm"
+
+FINGPT_MULTIDIM_PROFILE = "mt-llama2-7b"
+FINGPT_MULTIDIM_MAX_INPUT_TOKENS = 3072
+FINGPT_MULTIDIM_MAX_NEW_TOKENS = 1024

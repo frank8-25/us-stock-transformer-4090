@@ -5,35 +5,12 @@ from typing import Iterable
 
 import pandas as pd
 
-from config import FINGPT_DEFAULT_MODEL_PROFILE, FINGPT_DEFAULT_QUANTIZATION
+from config import (
+    FINGPT_DEFAULT_MODEL_PROFILE, FINGPT_DEFAULT_QUANTIZATION,
+    FINGPT_SENTIMENT_MODEL, FINGPT_BASE_MODEL, FINGPT_ADAPTER_TYPE, FINGPT_MODEL_PROFILES,
+)
 
 
-FINGPT_SENTIMENT_MODEL = "FinGPT/fingpt-sentiment_llama2-13b_lora"
-FINGPT_BASE_MODEL = "NousResearch/Llama-2-13b-hf"
-FINGPT_ADAPTER_TYPE = "LoRA"
-FINGPT_MODEL_PROFILES = {
-    "sentiment-llama2-13b": {
-        "model_name": "FinGPT/fingpt-sentiment_llama2-13b_lora",
-        "base_model": "NousResearch/Llama-2-13b-hf",
-        "base_model_description": "Llama2-13B",
-        "task": "Sentiment Analysis",
-    },
-    "mt-llama2-7b": {
-        "model_name": "FinGPT/fingpt-mt_llama2-7b_lora",
-        "base_model": "NousResearch/Llama-2-7b-hf",
-        "base_model_description": "Llama2-7B",
-        "task": "Multi-Task, using Financial Sentiment Analysis instruction",
-        "architecture": "causal_lm",
-    },
-    "sentiment-chatglm2-6b": {
-        "model_name": "oliverwang15/FinGPT_ChatGLM2_Sentiment_Instruction_LoRA_FT",
-        "base_model": "THUDM/chatglm2-6b",
-        "base_model_description": "ChatGLM2-6B",
-        "task": "Sentiment Analysis",
-        "architecture": "chatglm",
-    },
-}
-FINGPT_MODEL_PROFILES["sentiment-llama2-13b"]["architecture"] = "causal_lm"
 FINGPT_PROMPT = (
     "Instruction: What is the sentiment of this news? "
     "Please choose an answer from {{negative/neutral/positive}}\n"

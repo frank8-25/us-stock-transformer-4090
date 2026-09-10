@@ -55,6 +55,8 @@ def summarize_results(outputs: pd.DataFrame) -> dict:
 def write_html_report(report: dict, outputs: pd.DataFrame,
                       path: str | Path = HTML_REPORT_FILE) -> None:
     """Escape all data; never modify or truncate the source dataframe."""
+    if report.get("analysis_mode", "sentiment") == "multidimensional":
+        return write_multidimensional_html_report(report, outputs, path)
     summary = summarize_results(outputs)
     esc = lambda value: escape(display_text(value), quote=True)
     metadata = {
@@ -174,4 +176,110 @@ Text previews are limited to 240 characters; the CSV retains full text.</p>
 and uncertainty will be designed and validated in a later phase; no such scores are generated here.</p>
 </main></body></html>
 """
+    Path(path).write_text(document, encoding="utf-8")
+
+
+def write_multidimensional_html_report(report, outputs, path):
+    """Render only validated rows in aggregates; keep error rows visible in the table."""
+    import json
+    from fingpt_multidimensional import NUMERIC_RANGES, EVENT_TYPES, SCHEMA_FIELDS, EXPERIMENT_NOTICE
+    records = outputs.to_dict(orient="records")
+
+    def esc(value):
+        if isinstance(value, list):
+            value = json.dumps(value, ensure_ascii=False)
+        return escape(display_text(value), quote=True)
+
+    def valid(row):
+        return (
+            not display_text(row.get("fingpt_error")).strip()
+            and bool(display_text(row.get("fingpt_raw_output")).strip())
+            and row.get("event_type") in EVENT_TYPES
+            and all(display_text(row.get(field)) != "" for field in NUMERIC_RANGES)
+        )
+
+    successful = [row for row in records if valid(row)]
+    cards = []
+    for field, bounds in NUMERIC_RANGES.items():
+        values = [float(row[field]) for row in successful]
+        mean = f"{sum(values)/len(values):.3f}" if values else "N/A"
+        cards.append(f'<div class="card"><span>{field} ({bounds[0]}..{bounds[1]})</span><strong>{mean}</strong></div>')
+    events = []
+    for event in EVENT_TYPES:
+        count = sum(row["event_type"] == event for row in successful)
+        percent = count/len(successful)*100 if successful else 0
+        events.append(f'<div class="event"><span>{event}</span><div class="track">'
+                      f'<div class="bar" style="width:{percent:.3f}%"></div></div><span>{count}</span></div>')
+    columns = ["date", "source_type", "text_preview", *SCHEMA_FIELDS,
+               "fingpt_raw_output", "fingpt_inference_seconds", "fingpt_error"]
+    table = []
+    for row in records:
+        preview = " ".join(display_text(row.get("text")).split())
+        preview = preview if len(preview) <= 240 else preview[:237] + "..."
+        cells = []
+        for column in columns:
+            value = preview if column == "text_preview" else row.get(column)
+            content = esc(value)
+            if column in NUMERIC_RANGES and content:
+                number = float(value)
+                if column in {"risk", "uncertainty", "price_narrative"}:
+                    tone = "concern" if number > 0 else "neutral"
+                elif column == "relevance":
+                    tone = "neutral"
+                else:
+                    tone = "positive" if number > 0 else "negative" if number < 0 else "neutral"
+                content = f'<span class="{tone}">{content}</span>'
+            if column == "fingpt_raw_output":
+                content = f"<details><summary>Raw output</summary><pre>{content}</pre></details>"
+            cells.append(f'<td class="{column}">{content or "null"}</td>')
+        table.append(f'<tr class="{"success" if valid(row) else "error"}">{"".join(cells)}</tr>')
+    if not table:
+        table.append(f'<tr><td colspan="{len(columns)}">No rows available.</td></tr>')
+    metadata = "".join(f"<dt>{key}</dt><dd>{esc(report.get(key))}</dd>" for key in
+                       ["run_id", "started_at", "finished_at", "model_profile", "model_name", "quantization", "status"])
+    error = esc(report.get("fingpt_error"))
+    traces = esc(report.get("traceback"))
+    times = [float(row["fingpt_inference_seconds"]) for row in successful
+             if display_text(row.get("fingpt_inference_seconds"))]
+    average = f"{sum(times)/len(times):.4f} s" if times else "N/A"
+    document = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FinGPT experimental multidimensional extraction</title>
+<style>
+body {{margin:0;background:#f4f6f8;color:#182332;font:15px/1.5 system-ui,sans-serif}}
+main {{padding:28px;max-width:1700px;margin:auto}}
+section {{background:white;border:1px solid #dce2e8;border-radius:10px;padding:20px;margin:20px 0}}
+dl {{display:grid;grid-template-columns:150px 1fr;gap:8px}} dd {{margin:0;overflow-wrap:anywhere}}
+.cards {{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}}
+.card {{padding:16px;background:white;border:1px solid #dce2e8;border-radius:8px}}
+.card span {{display:block;color:#536172}} .card strong {{font-size:25px}}
+.note {{color:#536172}} .event {{display:grid;grid-template-columns:150px 1fr 40px;gap:15px;margin:8px 0}}
+.track {{height:15px;background:#edf0f3}} .bar {{height:100%;background:#4466a0}}
+.table-scroll {{overflow:auto}} table {{border-collapse:collapse;font-size:13px}}
+th,td {{text-align:left;vertical-align:top;padding:10px;border-bottom:1px solid #dce2e8}}
+th {{background:#edf1f5;white-space:nowrap}} td {{min-width:90px;max-width:400px;overflow-wrap:anywhere}}
+.text_preview,.summary,.evidence,.positive_factors,.potential_concerns {{min-width:230px}}
+.positive {{color:#166534}} .negative {{color:#991b1b}} .neutral {{color:#526071}}
+.concern,.fingpt_error {{color:#9a3412}} .error {{background:#fff0df}}
+pre {{white-space:pre-wrap;overflow-wrap:anywhere;min-width:240px;max-width:450px}}
+</style></head><body><main>
+<h1>FinGPT multidimensional results</h1>
+<p class="note">{esc(EXPERIMENT_NOTICE)}</p>
+<section><dl>{metadata}</dl>
+<p>Total: {len(records)} &middot; Successful: {len(successful)} &middot;
+Failed: {len(records)-len(successful)} &middot; Average successful inference: {average}</p>
+<p class="fingpt_error">{error}</p>
+<details><summary>Traceback</summary><pre>{traces}</pre></details></section>
+<h2>Mean dimension values</h2>
+<p class="note">Only successfully validated rows are included. No results: N/A (not zero).</p>
+<div class="cards">{"".join(cards)}</div>
+<section><h2>Event counts</h2>{"".join(events)}</section>
+<section><h2>Per-row results</h2>
+<p class="note">CSV retains full text. HTML text_preview is limited to 240 characters.
+Invalid extraction fields remain null; error rows are excluded from averages and counts.</p>
+<div class="table-scroll"><table><thead><tr>
+{"".join(f'<th scope="col">{column}</th>' for column in columns)}
+</tr></thead><tbody>{"".join(table)}</tbody></table></div></section>
+</main></body></html>"""
     Path(path).write_text(document, encoding="utf-8")

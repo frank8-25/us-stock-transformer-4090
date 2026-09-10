@@ -30,6 +30,10 @@ from fingpt_sentiment import (
     parse_sentiment_label,
     run_fingpt_batch,
 )
+from fingpt_multidimensional import (
+    SCHEMA_FIELDS, NUMERIC_RANGES, EXPERIMENT_NOTICE, csv_ready,
+    run_multidimensional_batch, validate_analysis_profile,
+)
 from pipeline_utils import save_csv
 from fingpt_report import HTML_REPORT_FILE, summarize_results, write_html_report
 
@@ -103,6 +107,7 @@ def build_direct_text_sample(text: str) -> pd.DataFrame:
 
 def write_report(report: dict, sample_outputs: pd.DataFrame,
                  path: str | Path = REPORT_FILE) -> None:
+    multidimensional = report.get("analysis_mode", "sentiment") == "multidimensional"
     examples = sample_outputs.head(8).to_dict(orient="records") if not sample_outputs.empty else []
     lines = [
         "# FinGPT Smoke Test Report",
@@ -112,6 +117,7 @@ def write_report(report: dict, sample_outputs: pd.DataFrame,
         f"- Started at: {report.get('started_at')}",
         f"- Finished at: {report.get('finished_at')}",
         f"- Model profile: {report.get('model_profile')}",
+        f"- Analysis mode: {report.get('analysis_mode', 'sentiment')}",
         f"- Ticker: {TICKER}",
         f"- FinGPT model: `{report.get('model_name') or FINGPT_SENTIMENT_MODEL}`",
         f"- Base model: `{report.get('base_model') or FINGPT_BASE_MODEL}`",
@@ -142,7 +148,7 @@ def write_report(report: dict, sample_outputs: pd.DataFrame,
         f"- Rows completed: `{report.get('completed_rows')}`",
         f"- Successful rows: `{report.get('successful_rows')}`",
         f"- Failed / incomplete rows: `{report.get('failed_rows')}`",
-        "Only sentiment is validated. Multidimensional outputs will be designed and validated in a later phase.",
+        EXPERIMENT_NOTICE if multidimensional else "Only sentiment is validated. Multidimensional outputs will be designed and validated in a later phase.",
         "",
         "## Timing",
         "",
@@ -155,8 +161,8 @@ def write_report(report: dict, sample_outputs: pd.DataFrame,
         "",
         "- `date`",
         "- `text`",
-        "- `sentiment_label`",
-        "- `sentiment_score`",
+        *([f"- `{field}`" for field in SCHEMA_FIELDS] if multidimensional else
+          ["- `sentiment_label`", "- `sentiment_score`"]),
         "- `model_profile`",
         "- `model_name`",
         "- `fingpt_raw_output`",
@@ -168,7 +174,8 @@ def write_report(report: dict, sample_outputs: pd.DataFrame,
         "## Output Examples",
         "",
         "```json",
-        json.dumps(examples, ensure_ascii=False, indent=2)[:4000],
+        (json.dumps(examples, ensure_ascii=False, indent=2, allow_nan=False) if multidimensional
+         else json.dumps(examples, ensure_ascii=False, indent=2)[:4000]),
         "```",
         "",
         "## Result",
@@ -192,6 +199,8 @@ def main() -> int:
     parser.add_argument("--tenk-limit", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--allow-cpu", action="store_true")
+    parser.add_argument("--analysis-mode", choices=["sentiment", "multidimensional"], default="sentiment",
+                        help="Experimental multidimensional extraction requires mt-llama2-7b.")
     parser.add_argument(
         "--model-profile",
         choices=sorted(FINGPT_MODEL_PROFILES),
@@ -205,6 +214,13 @@ def main() -> int:
         help="Run one direct-text smoke test without reading News, Earnings Call, or 10-K CSV files.",
     )
     args = parser.parse_args()
+    try:
+        validate_analysis_profile(args.analysis_mode, args.model_profile)
+    except ValueError as exc:
+        parser.error(str(exc))
+    multidimensional = args.analysis_mode == "multidimensional"
+    if multidimensional and args.batch_size != 1:
+        parser.error("multidimensional mode currently requires --batch-size 1.")
     if args.batch_size < 1 or min(args.news_limit, args.call_limit, args.tenk_limit) < 0:
         parser.error("batch-size must be positive and sample limits must be nonnegative.")
     direct_text = args.text.strip() if args.text is not None else None
@@ -236,6 +252,7 @@ def main() -> int:
         "tenk_limit": args.tenk_limit,
         "batch_size": effective_batch_size,
         "input_mode": input_mode,
+        "analysis_mode": args.analysis_mode,
         "model_profile": args.model_profile,
         "model_name": FINGPT_MODEL_PROFILES[args.model_profile]["model_name"],
         "base_model": FINGPT_MODEL_PROFILES[args.model_profile]["base_model"],
@@ -263,6 +280,7 @@ def main() -> int:
                 "base_model": FINGPT_MODEL_PROFILES[args.model_profile]["base_model"],
                 "base_model_description": FINGPT_MODEL_PROFILES[args.model_profile]["base_model_description"],
                 "adapter": FINGPT_ADAPTER_TYPE,
+                "analysis_mode": args.analysis_mode,
                 "quantization": args.quantization,
                 "official_source": "https://github.com/AI4Finance-Foundation/FinGPT",
                 "huggingface_model": f"https://huggingface.co/{FINGPT_MODEL_PROFILES[args.model_profile]['model_name']}",
@@ -274,8 +292,9 @@ def main() -> int:
 
     output_df = sample_df.copy()
     rows = []
-    for column in ["sentiment_label", "sentiment_score", "fingpt_raw_output",
-                   "fingpt_inference_seconds", "fingpt_error"]:
+    value_columns = list(SCHEMA_FIELDS) if multidimensional else ["sentiment_label", "sentiment_score"]
+    row_tracebacks = []
+    for column in value_columns + ["fingpt_raw_output", "fingpt_inference_seconds", "fingpt_error"]:
         output_df[column] = None
     output_df["model_profile"] = args.model_profile
     output_df["model_name"] = report["model_name"]
@@ -302,6 +321,23 @@ def main() -> int:
         texts = sample_df["text"].fillna("").astype(str).tolist()
         for start_idx in range(0, len(texts), effective_batch_size):
             batch = texts[start_idx : start_idx + effective_batch_size]
+            if multidimensional:
+                sources = sample_df.iloc[start_idx:start_idx + effective_batch_size].to_dict("records")
+                batch_results, seconds = run_multidimensional_batch(
+                    tokenizer, model, batch, [row["source_type"] for row in sources], load_info.model_name,
+                )
+                if len(batch_results) != len(batch):
+                    raise RuntimeError("FinGPT returned a different number of results than inputs.")
+                total_inference_seconds += seconds
+                report["total_inference_seconds"] = round(total_inference_seconds, 4)
+                for source_row, result in zip(sources, batch_results):
+                    result = dict(result)
+                    row_trace = result.pop("_traceback", "")
+                    if row_trace:
+                        row_tracebacks.append(row_trace)
+                    rows.append({**source_row, **result, "model_profile": args.model_profile,
+                                 "analysis_mode": args.analysis_mode})
+                continue
             batch_results, seconds = run_fingpt_batch(
                 tokenizer,
                 model,
@@ -328,7 +364,12 @@ def main() -> int:
                         "fingpt_inference_seconds": round(seconds / max(len(batch), 1), 4),
                     }
                 )
-        output_df = pd.DataFrame(rows)
+        output_df = pd.DataFrame(rows, dtype=object) if multidimensional else pd.DataFrame(rows)
+        if multidimensional:
+            failed = [row for row in rows if row.get("fingpt_error")]
+            if failed:
+                raise RuntimeError(f"{len(failed)} multidimensional rows failed: " +
+                                   "; ".join(row["fingpt_error"] for row in failed))
         report["completed_rows"] = len(output_df)
         report["total_inference_seconds"] = round(total_inference_seconds, 4)
         report["avg_inference_seconds"] = round(total_inference_seconds / max(len(output_df), 1), 4)
@@ -343,7 +384,7 @@ def main() -> int:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["fingpt_error"] = report["error"]
-        report["traceback"] = traceback.format_exc()
+        report["traceback"] = "\n".join(row_tracebacks + [traceback.format_exc()])
         traceback.print_exc()
         report["completed_rows"] = len(rows)
         # Preserve completed rows; mark failed and unattempted rows explicitly.
@@ -360,12 +401,21 @@ def main() -> int:
         else:
             report["recommendation"] = "Resolve the reported model load/inference error before scaling beyond smoke test."
 
+    if multidimensional:
+        report["suitable_for_full_dataset"] = False
+        report["recommendation"] = EXPERIMENT_NOTICE
+        output_df = output_df.astype(object).where(output_df.notna(), None)
+        output_df["analysis_mode"] = args.analysis_mode
+        for field in NUMERIC_RANGES:
+            output_df[field] = pd.array(output_df[field], dtype="Int64")
     report["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     summary = summarize_results(output_df)
     report["successful_rows"] = summary["success"]
     report["failed_rows"] = summary["failed"]
     report["avg_inference_seconds"] = summary["average_seconds"]
-    save_csv(output_df, str(sample_output))
+    if multidimensional:
+        report["completed_rows"] = summary["success"]
+    save_csv(csv_ready(output_df) if multidimensional else output_df, str(sample_output))
     archived_markdown = archive_dir / REPORT_FILE
     archived_html = archive_dir / HTML_REPORT_FILE
     write_report(report, output_df, archived_markdown)
@@ -383,6 +433,9 @@ def main() -> int:
             "fingpt_inference_seconds",
             "fingpt_error",
         ]
+        if multidimensional:
+            direct_fields = list(SCHEMA_FIELDS) + ["fingpt_raw_output", "model_profile", "model_name",
+                                                  "fingpt_inference_seconds", "fingpt_error"]
         direct_output = {
             field: output_df.head(1).to_dict(orient="records")[0].get(field)
             for field in direct_fields
