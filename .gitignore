@@ -58,9 +58,7 @@ data/raw/
 data/processed/
 data/final/
 data/backup/
-data/archive/**
-!data/archive/**/
-!data/archive/**/README.md
+data/archive/
 fingpt_smoke_test_report.md
 fingpt_smoke_test_report.html
 outputs/
@@ -77,3 +75,15 @@ temp/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# End-to-end pipeline outputs (raw inputs and prior archives are preserved)
+data/pipeline_runs/
+
+# Read-only text dataset inspection reports (any output directory)
+dataset_inspection_report.json
+dataset_inspection_report.md
+dataset_inspection_report.html
+
+# Local model-probe outputs (probe source and tests remain tracked)
+probe_*_results.json
+probe_*_results.csv
