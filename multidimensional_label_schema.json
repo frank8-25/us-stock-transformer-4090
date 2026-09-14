@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "multidimensional_label_schema.json",
+  "title": "FinGPT MT 7B multidimensional annotation record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sample_id",
+    "ticker",
+    "source_type",
+    "published_at",
+    "as_of_date",
+    "title",
+    "text",
+    "labels",
+    "evidence",
+    "annotator",
+    "annotation_version",
+    "split"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ticker": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9.-]{0,9}$"
+    },
+    "source_type": {
+      "enum": [
+        "news",
+        "earnings_call",
+        "ten_k"
+      ]
+    },
+    "published_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "as_of_date": {
+      "type": "string",
+      "format": "date"
+    },
+    "title": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sentiment",
+        "growth_outlook",
+        "financial_strength",
+        "fundamental_impact",
+        "short_term_impact",
+        "long_term_impact",
+        "risk_presence",
+        "uncertainty_presence",
+        "relevance",
+        "price_narrative"
+      ],
+      "properties": {
+        "sentiment": {
+          "$ref": "#/$defs/directionalLabel",
+          "description": "Direction of the information impact and overall financial sentiment specifically toward NVDA; not writing tone or sentiment about another company."
+        },
+        "growth_outlook": {
+          "$ref": "#/$defs/directionalLabel"
+        },
+        "financial_strength": {
+          "$ref": "#/$defs/directionalLabel"
+        },
+        "fundamental_impact": {
+          "$ref": "#/$defs/directionalLabel"
+        },
+        "short_term_impact": {
+          "$ref": "#/$defs/directionalLabel"
+        },
+        "long_term_impact": {
+          "$ref": "#/$defs/directionalLabel"
+        },
+        "risk_presence": {
+          "$ref": "#/$defs/binaryLabel"
+        },
+        "uncertainty_presence": {
+          "$ref": "#/$defs/binaryLabel"
+        },
+        "relevance": {
+          "$ref": "#/$defs/binaryLabel"
+        },
+        "price_narrative": {
+          "$ref": "#/$defs/binaryLabel"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sentiment": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "growth_outlook": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "financial_strength": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "fundamental_impact": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "short_term_impact": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "long_term_impact": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "risk_presence": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "uncertainty_presence": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "relevance": {
+          "$ref": "#/$defs/evidenceList"
+        },
+        "price_narrative": {
+          "$ref": "#/$defs/evidenceList"
+        }
+      }
+    },
+    "annotator": {
+      "type": "string",
+      "minLength": 1
+    },
+    "annotation_version": {
+      "const": "v1"
+    },
+    "split": {
+      "enum": [
+        "train",
+        "validation",
+        "test"
+      ]
+    }
+  },
+  "$defs": {
+    "directionalLabel": {
+      "enum": [
+        "negative",
+        "neutral",
+        "positive",
+        "insufficient_information"
+      ]
+    },
+    "binaryLabel": {
+      "enum": [
+        "yes",
+        "no"
+      ]
+    },
+    "evidenceList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "quote",
+          "start",
+          "end"
+        ],
+        "properties": {
+          "quote": {
+            "type": "string",
+            "minLength": 1
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  },
+  "x-canonical-input": "title + \"\n\" + text when title is nonempty; otherwise text",
+  "x-evidence-policy": {
+    "directional": "required except for insufficient_information",
+    "binary": "required for yes and optional for no",
+    "insufficient_information": "must have no evidence",
+    "offsets": "zero-based half-open [start,end] over canonical input"
+  },
+  "x-annotation-semantics": {
+    "sentiment": "Target-specific NVDA information impact, not prose tone or another entity sentiment.",
+    "future-information": "Labels use only information available at published_at."
+  }
+}
