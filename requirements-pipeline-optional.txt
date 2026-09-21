@@ -1,4 +1,6 @@
-# Optional network/PDF stages only. Core offline pipeline uses existing numpy/pandas/torch.
+# Optional network/PDF and title-clustering stages only.
 # Do not reinstall Torch or the FinGPT stack when adding these optional dependencies.
 pypdf
 yfinance
+sentence-transformers==6.0.1
+scikit-learn==1.9.1
