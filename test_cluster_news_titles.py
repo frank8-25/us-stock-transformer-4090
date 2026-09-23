@@ -49,11 +49,11 @@ class DeduplicationTests(unittest.TestCase):
             row("Different wording", "20240102T010000Z", "https://a", "example.com"),
         ])
         rows, canonical = module.prepare_rows(data)
-        self.assertEqual(int(rows.exact_duplicate.sum()), 2)
-        self.assertEqual(len(canonical), 1)
+        self.assertEqual(int(rows.exact_duplicate.sum()), 1)
+        self.assertEqual(len(canonical), 2)
         self.assertEqual(rows.iloc[0].duplicate_of_row_id, "")
         self.assertTrue(rows.iloc[1].duplicate_of_row_id)
-        self.assertTrue(rows.iloc[2].duplicate_of_row_id)
+        self.assertFalse(rows.iloc[2].exact_duplicate)
 
     def test_stable_row_id_is_reproducible_and_duplicate_safe(self):
         data = frame([
@@ -64,6 +64,15 @@ class DeduplicationTests(unittest.TestCase):
         second = module.stable_row_ids(data.copy())
         self.assertEqual(first, second)
         self.assertEqual(len(set(first)), 2)
+
+    def test_same_url_different_titles_are_not_grouped_as_exact_duplicates(self):
+        data = frame([
+            row("NVIDIA rises as demand surges", "20240102T090000Z", "https://example.com/nvda"),
+            row("NVIDIA falls as demand cools", "20240102T091500Z", "https://example.com/nvda"),
+        ])
+        rows, canonical = module.prepare_rows(data)
+        self.assertEqual(len(canonical), 2)
+        self.assertFalse(rows.iloc[1].exact_duplicate)
 
     def test_empty_url_is_allowed(self):
         rows, canonical = module.prepare_rows(frame([row("Valid title", "20240101T010000Z")]))

@@ -1,6 +1,6 @@
 # Optional network/PDF and title-clustering stages only.
 # Do not reinstall Torch or the FinGPT stack when adding these optional dependencies.
 pypdf
-yfinance
+yfinance==1.7.0
 sentence-transformers==6.0.1
 scikit-learn==1.9.1

@@ -43,6 +43,21 @@ def _plain_words(value):
     return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
+def _literal_title_similarity(left, right):
+    left_title = normalize_title(left)
+    right_title = normalize_title(right)
+    if not left_title or not right_title:
+        return 0.0
+    if left_title == right_title:
+        return 1.0
+    left_tokens = set(re.findall(r"[a-z0-9]+", left_title))
+    right_tokens = set(re.findall(r"[a-z0-9]+", right_title))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    union = left_tokens | right_tokens
+    return len(left_tokens & right_tokens) / len(union)
+
+
 def _verified_media_suffix(suffix, domain, source):
     suffix_words = _plain_words(suffix)
     if len(suffix_words) < 3:
@@ -148,16 +163,21 @@ def prepare_rows(frame):
         result["domain"] = ""
 
     union = UnionFind(len(result))
-    first_url = {}
+    first_url = defaultdict(list)
     first_date_title = {}
     for index, row in result.iterrows():
         url = row["url"].strip()
         date_title = (row["published_at"][:10], row["normalized_title"])
         if url:
-            if url in first_url:
-                union.union(first_url[url], index)
-            else:
-                first_url[url] = index
+            for prior_index in first_url[url]:
+                prior_row = result.iloc[prior_index]
+                if row["normalized_title"] == prior_row["normalized_title"]:
+                    union.union(prior_index, index)
+                    continue
+                score = _literal_title_similarity(row["normalized_title"], prior_row["normalized_title"])
+                if score >= 0.85 and abs((row["_published"] - prior_row["_published"]).total_seconds()) <= 72 * 3600:
+                    union.union(prior_index, index)
+            first_url[url].append(index)
         if date_title in first_date_title:
             union.union(first_date_title[date_title], index)
         else:

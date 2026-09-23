@@ -1,7 +1,7 @@
 pandas
 requests
 transformers
-yfinance
+yfinance==1.7.0
 pytrends
 torch
 scikit-learn
