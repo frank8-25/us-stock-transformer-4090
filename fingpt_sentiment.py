@@ -179,6 +179,17 @@ def run_fingpt_batch(
 
     prompts = [build_fingpt_prompt(text) for text in texts]
     start = time.perf_counter()
+
+    def fail_result(raw_output: str, error: str, label: str = "") -> dict:
+        cleaned = str(raw_output or "").strip()
+        return {
+            "sentiment_label": label,
+            "sentiment_score": None,
+            "model_name": model_name,
+            "fingpt_raw_output": cleaned,
+            "fingpt_error": error,
+        }
+
     if hasattr(model, "chat"):
         decoded = []
         for prompt in prompts:
@@ -187,15 +198,20 @@ def run_fingpt_batch(
         seconds = time.perf_counter() - start
         results = []
         for output in decoded:
-            if not output.strip():
-                raise RuntimeError("FinGPT generated an empty response.")
-            label = parse_sentiment_label(output)
+            cleaned = output.strip()
+            if not cleaned:
+                results.append(fail_result(output, "FinGPT generated an empty response."))
+                continue
+            label = parse_sentiment_label(cleaned)
+            if label is None:
+                results.append(fail_result(cleaned, "FinGPT returned no parseable sentiment label.", label="unparsed"))
+                continue
             results.append(
                 {
-                    "sentiment_label": label or "unparsed",
-                    "sentiment_score": score_label(label or "neutral"),
+                    "sentiment_label": label,
+                    "sentiment_score": score_label(label),
                     "model_name": model_name,
-                    "fingpt_raw_output": output.strip(),
+                    "fingpt_raw_output": cleaned,
                     "fingpt_error": "",
                 }
             )
@@ -225,12 +241,16 @@ def run_fingpt_batch(
     for output in decoded:
         raw_answer = output.strip()
         if not raw_answer:
-            raise RuntimeError("FinGPT generated an empty response.")
+            results.append(fail_result(output, "FinGPT generated an empty response."))
+            continue
         label = parse_sentiment_label(raw_answer)
+        if label is None:
+            results.append(fail_result(raw_answer, "FinGPT returned no parseable sentiment label.", label="unparsed"))
+            continue
         results.append(
             {
-                "sentiment_label": label or "unparsed",
-                "sentiment_score": score_label(label or "neutral"),
+                "sentiment_label": label,
+                "sentiment_score": score_label(label),
                 "model_name": model_name,
                 "fingpt_raw_output": raw_answer,
                 "fingpt_error": "",

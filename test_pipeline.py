@@ -13,7 +13,7 @@ import torch
 
 from pipeline_documents import BodyParser, chunk_text, prepare_documents, read_csv
 from pipeline_sentiment import build_dataset, build_features, infer_documents
-from pipeline_transformer import temporal_samples, train_transformer
+from pipeline_transformer import temporal_samples
 import run_pipeline
 
 
@@ -97,6 +97,40 @@ class PipelineTests(unittest.TestCase):
             again = infer_documents(docs, output, "sentiment-llama2-13b", "4bit")
         self.assertEqual(again.fingpt_error.tolist(), results.fingpt_error.tolist())
 
+    def test_run_fingpt_batch_handles_empty_generation(self):
+        class EmptyTokenizer:
+            eos_token_id = 2
+            pad_token_id = 2
+
+            def __call__(self, prompts, return_tensors=None, padding=None, truncation=None, max_length=None):
+                return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+            def batch_decode(self, pieces, skip_special_tokens=None):
+                return [""]
+
+        class EmptyModel:
+            device = "cpu"
+
+            def generate(self, **kwargs):
+                return torch.tensor([[1, 2, 3]])
+
+        rows, seconds = __import__("fingpt_sentiment").run_fingpt_batch(EmptyTokenizer(), EmptyModel(), ["example text"], model_name="mock")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sentiment_label"], "")
+        self.assertIsNone(rows[0]["sentiment_score"])
+        self.assertIn("empty response", rows[0]["fingpt_error"])
+
+    def test_unparsed_chat_generation_preserves_missing_score(self):
+        class ChatModel:
+            def chat(self, tokenizer, prompt, history=None):
+                return "unrecognizable output", None
+
+        rows, _ = __import__("fingpt_sentiment").run_fingpt_batch(
+            object(), ChatModel(), ["example"], model_name="mock")
+        self.assertEqual(rows[0]["sentiment_label"], "unparsed")
+        self.assertIsNone(rows[0]["sentiment_score"])
+        self.assertTrue(rows[0]["fingpt_error"])
+
     def test_model_load_failure_is_recorded_for_all_documents(self):
         self.make_raw(2)
         output = self.root / "failed_load"
@@ -169,17 +203,28 @@ class PipelineTests(unittest.TestCase):
             temporal_samples(dataset, ["future_return"], 4)
 
     def test_end_to_end_cli_with_mock_fingpt(self):
+        # Exercise CLI orchestration without training any Transformer.
+        def fake_train(dataset, columns, output, **kwargs):
+            self.assertNotIn("future_return", columns)
+            torch.save({"feature_columns": columns}, output / "transformer.pt")
+            for name in ("transformer_predictions.csv", "training_history.csv"):
+                (output / name).write_text("mock\n")
+            (output / "metrics.json").write_text(json.dumps({"test": {"majority_baseline_accuracy": 0.5}}))
+            (output / "training_config.json").write_text("{}")
+
         self.make_raw()
         prices = self.root / "fixture_prices.csv"
         dates = pd.bdate_range("2020-01-01", "2022-02-01")
         pd.DataFrame({"date": dates, "close": 100 + np.sin(np.arange(len(dates))/8)*5}).to_csv(prices, index=False)
         with patch("fingpt_sentiment.load_fingpt_model", return_value=(Tokenizer(), object(), None)), \
              patch("fingpt_sentiment.run_fingpt_batch", side_effect=self.prediction), \
+             patch("pipeline_transformer.train_transformer", side_effect=fake_train) as trainer, \
              contextlib.redirect_stdout(io.StringIO()):
             code = run_pipeline.main(["all", "--root", str(self.root), "--start", "2020-01-01",
                                       "--end", "2021-12-31", "--prices", str(prices),
                                       "--epochs", "1", "--lookback", "4"])
         self.assertEqual(code, 0)
+        trainer.assert_called_once()
         run = next((self.root / "data/pipeline_runs").iterdir())
         manifest = json.loads((run / "manifest.json").read_text())
         self.assertTrue(all(record["status"] == "completed" for record in manifest["stages"].values()))

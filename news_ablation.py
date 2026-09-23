@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -405,6 +405,19 @@ def align_news_to_trading_date(
     return out.drop(columns=["_published_at"], errors="ignore")
 
 
+def _normalize_effective_trading_date_series(series: pd.Series) -> pd.Series:
+    values = pd.Series(series, copy=True)
+    if values.empty:
+        return pd.Series([], index=values.index, dtype="datetime64[ns]")
+    try:
+        normalized = pd.to_datetime(values, errors="raise", utc=True, format="mixed")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid effective_trading_date values encountered: {exc}") from exc
+    if normalized.isna().any():
+        raise ValueError("Invalid effective_trading_date: missing dates are not allowed.")
+    return normalized.dt.tz_localize(None).dt.normalize().astype("datetime64[ns]")
+
+
 def build_daily_dissemination_features(rows: pd.DataFrame) -> pd.DataFrame:
     df = rows.copy()
     if df.empty:
@@ -416,6 +429,7 @@ def build_daily_dissemination_features(rows: pd.DataFrame) -> pd.DataFrame:
         ])
     if "effective_trading_date" not in df.columns:
         df = align_news_to_trading_date(df)
+    df["effective_trading_date"] = _normalize_effective_trading_date_series(df["effective_trading_date"])
     required = {"cluster_size_asof_t", "unique_domain_count_asof_t", "dissemination_span_hours_asof_t"}
     if not required.issubset(df.columns):
         return pd.DataFrame(columns=[
@@ -458,76 +472,39 @@ def build_daily_news_features(rows: pd.DataFrame, *, include_dissemination: bool
             empty["cluster_size_asof_t"] = pd.Series(dtype="float64")
             empty["unique_domain_count_asof_t"] = pd.Series(dtype="float64")
             empty["dissemination_span_hours_asof_t"] = pd.Series(dtype="float64")
+        empty["effective_trading_date"] = pd.Series(dtype="datetime64[ns]")
         return empty
-    df["sentiment_score"] = pd.to_numeric(df.get("sentiment_score", pd.Series([None] * len(df))), errors="coerce")
-    df["sentiment_label"] = df.get("sentiment_label", "").fillna("").astype(str).str.strip().str.lower()
-    df["fingpt_error"] = df.get("fingpt_error", "").fillna("").astype(str)
-    valid = df.loc[df["sentiment_label"].isin({"positive", "neutral", "negative"}) & df["fingpt_error"].eq("")].copy()
-    groups = valid.groupby("effective_trading_date", dropna=False) if "effective_trading_date" in valid.columns else pd.DataFrame(columns=["effective_trading_date"]).groupby("effective_trading_date", dropna=False)
+    df["effective_trading_date"] = _normalize_effective_trading_date_series(df["effective_trading_date"])
+    df["sentiment_score"] = pd.to_numeric(df.get("sentiment_score", pd.Series(index=df.index, dtype=float)), errors="coerce")
+    df["sentiment_label"] = df.get("sentiment_label", pd.Series("", index=df.index)).fillna("").astype(str).str.strip().str.lower()
+    df["fingpt_error"] = df.get("fingpt_error", pd.Series("", index=df.index)).fillna("").astype(str)
+    valid = (df["sentiment_label"].isin(LABEL_SCORES)
+             & df["fingpt_error"].eq("") & df["sentiment_score"].notna())
     daily = []
-    for day, group in groups:
-        score = pd.to_numeric(group["sentiment_score"], errors="coerce")
-        positive = int((group["sentiment_label"] == "positive").sum())
-        neutral = int((group["sentiment_label"] == "neutral").sum())
-        negative = int((group["sentiment_label"] == "negative").sum())
-        failures = int(df.loc[df["effective_trading_date"].eq(day), "fingpt_error"].fillna("" ).ne("" ).sum())
-        total = int(len(group) + failures)
-        n = len(group)
-        daily.append({
-            "effective_trading_date": str(day),
-            "news_sentiment_mean": float(score.mean()) if n else 0.0,
-            "news_sentiment_sum": float(score.sum()) if n else 0.0,
-            "news_sentiment_std": float(score.std(ddof=0)) if n > 1 else 0.0,
-            "news_positive_count": positive,
-            "news_neutral_count": neutral,
-            "news_negative_count": negative,
-            "news_positive_ratio": positive / n if n else 0.0,
-            "news_neutral_ratio": neutral / n if n else 0.0,
-            "news_negative_ratio": negative / n if n else 0.0,
-            "news_item_or_event_count": total,
-            "news_has_data": int(total > 0),
-            "news_inference_failure_count": failures,
-        })
-    all_days = pd.Index(sorted(df["effective_trading_date"].dropna().unique())) if "effective_trading_date" in df.columns else pd.Index([])
-    summary = pd.DataFrame({"effective_trading_date": all_days})
-    if not daily:
-        result = summary.assign(
-            news_sentiment_mean=0.0,
-            news_sentiment_sum=0.0,
-            news_sentiment_std=0.0,
-            news_positive_count=0,
-            news_neutral_count=0,
-            news_negative_count=0,
-            news_positive_ratio=0.0,
-            news_neutral_ratio=0.0,
-            news_negative_ratio=0.0,
-            news_item_or_event_count=0,
-            news_has_data=0,
-            news_inference_failure_count=0,
-        )
-    else:
-        daily_df = pd.DataFrame(daily)
-        result = summary.merge(daily_df, on="effective_trading_date", how="left")
-        result = result.fillna({
-            "news_sentiment_mean": 0.0,
-            "news_sentiment_sum": 0.0,
-            "news_sentiment_std": 0.0,
-            "news_positive_count": 0,
-            "news_neutral_count": 0,
-            "news_negative_count": 0,
-            "news_positive_ratio": 0.0,
-            "news_neutral_ratio": 0.0,
-            "news_negative_ratio": 0.0,
-            "news_item_or_event_count": 0,
-            "news_has_data": 0,
-            "news_inference_failure_count": 0,
-        })
-    result["news_item_or_event_count"] = result["news_item_or_event_count"].astype(int)
-    result["news_has_data"] = result["news_has_data"].astype(int)
-    result["news_inference_failure_count"] = result["news_inference_failure_count"].astype(int)
+    for day, group in df.groupby("effective_trading_date", sort=True):
+        successful = group.loc[valid.loc[group.index]]
+        score = successful["sentiment_score"]
+        n = len(successful)
+        row = {
+            "effective_trading_date": day,
+            "news_sentiment_mean": float(score.mean()) if n else np.nan,
+            "news_sentiment_sum": float(score.sum()) if n else np.nan,
+            "news_sentiment_std": float(score.std(ddof=0)) if n else np.nan,
+            "news_item_or_event_count": len(group),
+            "news_has_data": int(n > 0),
+            "news_inference_failure_count": len(group) - n,
+        }
+        for label in LABEL_SCORES:
+            count = int(successful["sentiment_label"].eq(label).sum())
+            row[f"news_{label}_count"] = count
+            row[f"news_{label}_ratio"] = count / n if n else np.nan
+        daily.append(row)
+    result = pd.DataFrame(daily)
+    result["effective_trading_date"] = _normalize_effective_trading_date_series(result["effective_trading_date"])
     if include_dissemination:
         dissemination = build_daily_dissemination_features(df)
-        result = result.merge(dissemination, on="effective_trading_date", how="left")
+        dissemination["effective_trading_date"] = _normalize_effective_trading_date_series(dissemination["effective_trading_date"])
+        result = result.merge(dissemination, on="effective_trading_date", how="left", validate="one_to_one")
     return result
 
 
@@ -833,6 +810,90 @@ def run_experiment_matrix(raw_news: pd.DataFrame, *, cache_dir: str | Path = "da
     return summary
 
 
+def _aggregate_existing_inference_run(run_dir: str | Path, *, prices_path: str | Path | None = None) -> dict[str, Any]:
+    run_dir = Path(run_dir).resolve()
+    if prices_path is None:
+        raise ValueError("Postprocess-only requires a frozen --prices calendar.")
+    calendar = _coerce_price_calendar(prices_path).astype("datetime64[ns]")
+    inference_dir = run_dir / "inference_results"
+    if not inference_dir.is_dir():
+        raise FileNotFoundError(f"Inference directory not found: {inference_dir}")
+    frames: dict[str, pd.DataFrame] = {}
+    for experiment in ("A", "B", "C", "D"):
+        csv_path = inference_dir / f"{experiment}_inference_results.csv"
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Missing inference CSV: {csv_path}")
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            raise ValueError(f"Empty inference CSV: {csv_path}")
+        df["effective_trading_date"] = _normalize_effective_trading_date_series(df["effective_trading_date"])
+        if not df["effective_trading_date"].isin(calendar).all():
+            raise ValueError(f"{experiment}: dates outside frozen price calendar")
+        if experiment == "D":
+            cluster_column = "cluster_id" if "cluster_id" in df else "document_id"
+            if df[cluster_column].isna().any() or df.duplicated([cluster_column, "effective_trading_date"]).any():
+                raise ValueError("Duplicate or missing D cluster/date keys")
+            for column, minimum in (("cluster_size_asof_t", 1), ("unique_domain_count_asof_t", 1), ("dissemination_span_hours_asof_t", 0)):
+                values = pd.to_numeric(df[column], errors="raise")
+                if not (np.isfinite(values) & values.ge(minimum)).all():
+                    raise ValueError(f"Invalid D dissemination column: {column}")
+        frames[experiment] = df
+    inference_hashes = {experiment: _sha256_file(inference_dir / f"{experiment}_inference_results.csv") for experiment in frames}
+    daily_dir = run_dir / "daily_features"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = run_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    daily_outputs: dict[str, pd.DataFrame] = {}
+    for experiment, frame in frames.items():
+        daily = build_daily_news_features(frame, include_dissemination=(experiment == "D"))
+        daily["effective_trading_date"] = pd.to_datetime(daily["effective_trading_date"], errors="raise").dt.strftime("%Y-%m-%d")
+        daily_outputs[experiment] = daily
+        csv_path = daily_dir / f"{experiment}_daily_features.csv"
+        daily.to_csv(csv_path, index=False)
+
+    report_lines = [
+        "# POSTPROCESS-ONLY DAILY AGGREGATION REPORT",
+        "",
+        f"run_dir: {run_dir}",
+        f"prices_path: {str(prices_path) if prices_path is not None else 'not provided'}",
+        "",
+        "## inference counts",
+    ]
+    for experiment, frame in frames.items():
+        report_lines.append(f"- {experiment}: {len(frame)} rows")
+    report_lines.extend([
+        "",
+        "## daily feature files",
+    ])
+    for experiment in ("A", "B", "C", "D"):
+        report_lines.append(f"- {experiment}: {daily_dir / f'{experiment}_daily_features.csv'}")
+    (report_dir / "postprocess_summary.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    run_manifest = {
+        "mode": "postprocess-only",
+        "new_inference_count": 0,
+        "inference_sha256": inference_hashes,
+        "prices_path": str(Path(prices_path).resolve()),
+        "prices_sha256": _sha256_file(Path(prices_path)),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "run_dir": str(run_dir),
+        "inference_csvs": {experiment: str(inference_dir / f"{experiment}_inference_results.csv") for experiment in ("A", "B", "C", "D")},
+        "daily_feature_csvs": {experiment: str(daily_dir / f"{experiment}_daily_features.csv") for experiment in ("A", "B", "C", "D")},
+        "safeguards": {
+            "fingpt_loaded": False,
+            "base_model_loaded": False,
+            "lora_loaded": False,
+            "cuda_inference_called": False,
+            "transformer_training_run": False,
+            "model_inference_restarted": False,
+        },
+        "inference_counts": {experiment: int(len(frame)) for experiment, frame in frames.items()},
+        "daily_row_counts": {experiment: int(len(daily_outputs[experiment])) for experiment in ("A", "B", "C", "D")},
+    }
+    (run_dir / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return run_manifest
+
+
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=None, help="Optional raw news CSV for an offline dry-run.")
@@ -843,12 +904,21 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="Resume from existing cache and do not re-run successful rows.")
     parser.add_argument("--dry-run", action="store_true", help="Offline-only dry run; never writes to raw data.")
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for offline testing.")
+    parser.add_argument("--aggregate-only", "--postprocess-only", dest="aggregate_only", action="store_true", help="Read existing A/B/C/D inference CSVs and generate only the daily feature and report artifacts without loading the FinGPT model or any model weights.")
+    parser.add_argument("--run-dir", type=Path, default=None, help="Existing pipeline run directory containing inference_results/, cache/, and reports/. Used with --aggregate-only.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
+    if args.aggregate_only:
+        if args.run_dir is None or args.prices is None:
+            parser.error("--postprocess-only requires --run-dir and --prices")
+        run_dir = args.run_dir
+        report = _aggregate_existing_inference_run(run_dir, prices_path=args.prices)
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
     if args.input is None and args.output_dir is None and not args.dry_run:
         parser.print_help()
         return 0

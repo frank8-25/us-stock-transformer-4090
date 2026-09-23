@@ -10,6 +10,7 @@ import pandas as pd
 from news_ablation import (
     ExperimentSpec,
     NewsInferenceCache,
+    _normalize_effective_trading_date_series,
     align_news_to_trading_date,
     build_cache_key,
     build_daily_dissemination_features,
@@ -350,6 +351,77 @@ class NewsAblationTests(unittest.TestCase):
         self.assertEqual(row["news_has_data"], 1)
         self.assertEqual(row["news_item_or_event_count"], 4)
 
+    def test_daily_news_features_normalize_mixed_datetime_and_string_keys(self):
+        left = pd.DataFrame([
+            {"effective_trading_date": pd.Timestamp("2024-01-02", tz="UTC"), "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+            {"effective_trading_date": pd.Timestamp("2024-01-03", tz="UTC") + pd.Timedelta(hours=5), "sentiment_label": "neutral", "sentiment_score": 0.0, "fingpt_error": ""},
+        ])
+        right = pd.DataFrame([
+            {"effective_trading_date": "2024-01-02", "sentiment_label": "negative", "sentiment_score": -1.0, "fingpt_error": ""},
+            {"effective_trading_date": "2024-01-03", "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+        ])
+        left_norm = left.copy()
+        right_norm = right.copy()
+        left_norm["effective_trading_date"] = _normalize_effective_trading_date_series(left_norm["effective_trading_date"])
+        right_norm["effective_trading_date"] = _normalize_effective_trading_date_series(right_norm["effective_trading_date"])
+        merged = left_norm.merge(right_norm, on="effective_trading_date", how="outer")
+        self.assertEqual(len(merged), 2)
+        self.assertTrue(pd.api.types.is_datetime64_any_dtype(merged["effective_trading_date"]))
+
+        left_str = pd.DataFrame([
+            {"effective_trading_date": "2024-01-02", "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+            {"effective_trading_date": "2024-01-03", "sentiment_label": "neutral", "sentiment_score": 0.0, "fingpt_error": ""},
+        ])
+        right_dt = pd.DataFrame([
+            {"effective_trading_date": pd.Timestamp("2024-01-02"), "sentiment_label": "neutral", "sentiment_score": 0.0, "fingpt_error": ""},
+            {"effective_trading_date": pd.Timestamp("2024-01-04"), "sentiment_label": "negative", "sentiment_score": -1.0, "fingpt_error": ""},
+        ])
+        left_str_norm = left_str.copy()
+        right_dt_norm = right_dt.copy()
+        left_str_norm["effective_trading_date"] = _normalize_effective_trading_date_series(left_str_norm["effective_trading_date"])
+        right_dt_norm["effective_trading_date"] = _normalize_effective_trading_date_series(right_dt_norm["effective_trading_date"])
+        merged2 = left_str_norm.merge(right_dt_norm, on="effective_trading_date", how="outer")
+        self.assertEqual(len(merged2), 3)
+        self.assertTrue(pd.api.types.is_datetime64_any_dtype(merged2["effective_trading_date"]))
+
+        daily = build_daily_news_features(pd.concat([
+            pd.DataFrame([
+                {"effective_trading_date": "2024-01-02T12:00:00+00:00", "sentiment_label": "neutral", "sentiment_score": 0.0, "fingpt_error": ""},
+                {"effective_trading_date": "2024-01-03T00:00:00+00:00", "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+            ]),
+            pd.DataFrame([
+                {"effective_trading_date": "2024-01-03", "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+            ]),
+        ], ignore_index=True))
+        self.assertListEqual(daily["effective_trading_date"].dt.strftime("%Y-%m-%d").tolist(), ["2024-01-02", "2024-01-03"])
+
+        with self.assertRaisesRegex(ValueError, "Invalid|datetime"):
+            build_daily_news_features(pd.DataFrame([
+                {"effective_trading_date": "not-a-date", "sentiment_label": "neutral", "sentiment_score": 0.0, "fingpt_error": ""}
+            ]))
+
+        sparse = pd.DataFrame([
+            {"effective_trading_date": "2024-01-02", "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+            {"effective_trading_date": "2024-01-02", "sentiment_label": "neutral", "sentiment_score": 0.0, "fingpt_error": ""},
+            {"effective_trading_date": "2024-01-03", "sentiment_label": "positive", "sentiment_score": 1.0, "fingpt_error": ""},
+            {"effective_trading_date": "2024-01-04", "sentiment_label": "", "sentiment_score": None, "fingpt_error": "timeout"},
+        ])
+        features = build_daily_news_features(sparse)
+        self.assertEqual(len(features), 3)
+        self.assertEqual(features.loc[features["effective_trading_date"] == "2024-01-04", "news_has_data"].iloc[0], 0)
+        self.assertEqual(features.loc[features["effective_trading_date"] == "2024-01-02", "news_neutral_count"].iloc[0], 1)
+
+    def test_d_snapshot_keys_remain_unique_after_date_normalization(self):
+        rows = pd.DataFrame([
+            {"cluster_id": "cluster-a", "effective_trading_date": pd.Timestamp("2024-01-02", tz="UTC"), "cluster_size_asof_t": 3, "unique_domain_count_asof_t": 2, "dissemination_span_hours_asof_t": 12.0},
+            {"cluster_id": "cluster-a", "effective_trading_date": "2024-01-02", "cluster_size_asof_t": 3, "unique_domain_count_asof_t": 2, "dissemination_span_hours_asof_t": 12.0},
+            {"cluster_id": "cluster-b", "effective_trading_date": "2024-01-03T12:00:00+00:00", "cluster_size_asof_t": 1, "unique_domain_count_asof_t": 1, "dissemination_span_hours_asof_t": 0.0},
+        ])
+        normalized = rows.copy()
+        normalized["effective_trading_date"] = _normalize_effective_trading_date_series(normalized["effective_trading_date"])
+        self.assertEqual(normalized["effective_trading_date"].duplicated().sum(), 1)
+        self.assertEqual(normalized.duplicated(subset=["cluster_id", "effective_trading_date"]).sum(), 1)
+
     def test_dissemination_features_are_causal(self):
         rows = pd.DataFrame([
             {"original_row_id": "a", "published_at": "2024-01-02T09:00:00Z", "domain": "a.com", "event_cluster_id": "cluster-1"},
@@ -399,6 +471,87 @@ class NewsAblationTests(unittest.TestCase):
             "dissemination_span_hours_asof_t",
         ])
         self.assertEqual(d_rows["cluster_size_asof_t"].tolist(), [2, 5])
+
+    def test_date_normalization_rejects_missing_and_preserves_index_and_resolution(self):
+        for value in (None, pd.NaT, "", "NaT", "not-a-date"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _normalize_effective_trading_date_series(pd.Series([value]))
+        for dtype in ("datetime64[us]", "datetime64[ns]"):
+            values = pd.Series([pd.Timestamp("2024-01-02")], index=[7], dtype=dtype)
+            result = _normalize_effective_trading_date_series(values)
+            self.assertEqual(str(result.dtype), "datetime64[ns]")
+            self.assertEqual(result.index.tolist(), [7])
+            self.assertEqual(len(result), len(values))
+
+    def test_failure_only_day_stays_missing_and_neutral_is_observed(self):
+        rows = pd.DataFrame([
+            dict(effective_trading_date="2024-01-03", sentiment_label="neutral", sentiment_score=0, fingpt_error=""),
+            dict(effective_trading_date="2024-01-02", sentiment_label="", sentiment_score=None, fingpt_error="timeout"),
+            dict(effective_trading_date="2024-01-02", sentiment_label="unparsed", sentiment_score=None, fingpt_error=""),
+        ])
+        result = build_daily_news_features(rows)
+        failed, neutral = result.iloc[0], result.iloc[1]
+        self.assertTrue(result.effective_trading_date.is_monotonic_increasing)
+        self.assertEqual(failed.news_has_data, 0)
+        self.assertEqual(failed.news_inference_failure_count, 2)
+        self.assertEqual(failed.news_item_or_event_count, 2)
+        self.assertEqual(failed.news_neutral_count, 0)
+        self.assertTrue(pd.isna(failed.news_sentiment_mean))
+        self.assertEqual(neutral.news_has_data, 1)
+        self.assertEqual(neutral.news_neutral_count, 1)
+        self.assertEqual(neutral.news_sentiment_mean, 0)
+
+    def _postprocess_fixture(self, root):
+        inference = root / "inference_results"
+        inference.mkdir()
+        for experiment in "ABCD":
+            pd.DataFrame([dict(document_id="cluster-a", effective_trading_date="2024-01-02",
+                               sentiment_label="neutral", sentiment_score=0, fingpt_error="",
+                               cluster_size_asof_t=1, unique_domain_count_asof_t=1,
+                               dissemination_span_hours_asof_t=0)]).to_csv(
+                inference / f"{experiment}_inference_results.csv", index=False)
+        prices = root / "prices.csv"
+        pd.DataFrame({"date": ["2024-01-02"]}).to_csv(prices, index=False)
+        return prices
+
+    def test_postprocess_cli_blocks_all_model_imports_and_preserves_inputs(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prices = self._postprocess_fixture(root)
+            before = {p: p.read_bytes() for p in (root / "inference_results").glob("*.csv")}
+            code = """
+import builtins, sys
+original = builtins.__import__
+blocked = {'torch', 'transformers', 'peft', 'fingpt_sentiment', 'pipeline_sentiment', 'pipeline_transformer', 'sentence_transformers'}
+def guarded(name, *args, **kwargs):
+    if name.split('.')[0] in blocked:
+        raise AssertionError('Model module forbidden: ' + name)
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+from news_ablation import main
+raise SystemExit(main(sys.argv[1:]))
+"""
+            completed = subprocess.run([sys.executable, "-c", code, "--postprocess-only",
+                                        "--run-dir", str(root), "--prices", str(prices)],
+                                       capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(before, {p: p.read_bytes() for p in before})
+            self.assertEqual(json.loads((root / "run_manifest.json").read_text())["new_inference_count"], 0)
+            for experiment in "ABCD":
+                daily = pd.read_csv(root / "daily_features" / f"{experiment}_daily_features.csv")
+                self.assertEqual(daily.effective_trading_date.tolist(), ["2024-01-02"])
+
+    def test_postprocess_rejects_outside_calendar_before_writes(self):
+        from news_ablation import _aggregate_existing_inference_run
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prices = self._postprocess_fixture(root)
+            pd.DataFrame({"date": ["2024-01-03"]}).to_csv(prices, index=False)
+            with self.assertRaisesRegex(ValueError, "outside frozen"):
+                _aggregate_existing_inference_run(root, prices_path=prices)
+            self.assertFalse((root / "daily_features").exists())
 
     def test_experiment_names_are_stable(self):
         self.assertEqual(ExperimentSpec.A.value, "A")
